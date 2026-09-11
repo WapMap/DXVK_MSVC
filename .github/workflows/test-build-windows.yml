@@ -1,4 +1,4 @@
-name: Test Builds on Windows
+name: Build on Windows
 
 on: [workflow_dispatch]
 
@@ -9,7 +9,7 @@ jobs:
     steps:
     - name: Checkout code
       id: checkout-code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
         fetch-depth: 0
@@ -52,7 +52,7 @@ jobs:
         & "${Env:COMSPEC}" /s /c "`"${Env:VSDEVCMD}`" -arch=x86 -host_arch=x64 -no_logo && set" `
           | % { , ($_ -Split '=', 2) } `
           | % { [System.Environment]::SetEnvironmentVariable($_[0], $_[1]) }
-        meson --buildtype release --backend vs2022 build-msvc-x86
+        meson --buildtype release --backend vs2026 -Db_lto=true -Dc_args="/O2 /Ob3 /Gw /arch:AVX2 /fp:contract" -Dcpp_args="/O2 /Ob3 /Gw /arch:AVX2 /fp:contract" build-msvc-x86
         msbuild -m build-msvc-x86/dxvk.sln
 
     - name: Build MSVC x64
@@ -61,17 +61,17 @@ jobs:
         & "${Env:COMSPEC}" /s /c "`"${Env:VSDEVCMD}`" -arch=x64 -host_arch=x64 -no_logo && set" `
           | % { , ($_ -Split '=', 2) } `
           | % { [System.Environment]::SetEnvironmentVariable($_[0], $_[1]) }
-        meson --buildtype release --backend vs2022 build-msvc-x64
+        meson --buildtype release --backend vs2026 -Db_lto=true -Dc_args="/O2 /Ob3 /Gw /arch:AVX2 /fp:contract" -Dcpp_args="/O2 /Ob3 /Gw /arch:AVX2 /fp:contract" build-msvc-x64
         msbuild -m build-msvc-x64/dxvk.sln
 
     - name: Prepare artifacts
       shell: pwsh
       run: |
         mkdir artifacts\x32
-        ls -Path build-msvc-x86\src -Include *.dll,*.pdb -Recurse
+        ls -Path build-msvc-x86\src -Include *.dll -Recurse
           | cp -Destination (Join-Path -Path (pwd) -ChildPath artifacts\x32)
         mkdir artifacts\x64
-        ls -Path build-msvc-x64\src -Include *.dll,*.pdb -Recurse
+        ls -Path build-msvc-x64\src -Include *.dll -Recurse
           | cp -Destination (Join-Path -Path (pwd) -ChildPath artifacts\x64)
 
     - name: Upload artifacts

@@ -184,7 +184,7 @@ namespace dxvk {
       m_presenter->setSurfaceFormat(GetSurfaceFormat(pDesc->Format));
 
     if (m_desc.Width != pDesc->Width || m_desc.Height != pDesc->Height)
-      m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
+      m_presenter->setSurfaceExtent({ pDesc->Width, pDesc->Height });
 
     m_desc = *pDesc;
     CreateBackBuffers();
@@ -1069,8 +1069,20 @@ namespace dxvk {
       }
     }
 
-    // Ensure D3D context state is properly reapplied
-    pContext->EmitCs([] (DxvkContext* ctx) {
+    // Write composition image back to last back buffer, apparently
+    // this is supposed to be fully preserved across frames.
+    pContext->EmitCs([
+      cComposition = m_compositionBuffer,
+      cBackBuffer  = GetCommonTexture(m_backBuffers.back().ptr())->GetImage()
+    ] (DxvkContext* ctx) {
+      VkImageSubresourceLayers subresource = {};
+      subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      subresource.layerCount = 1u;
+
+      ctx->copyImage(cBackBuffer, subresource, VkOffset3D(),
+        cComposition, subresource, VkOffset3D(),
+        cComposition->mipLevelExtent(0u));
+
       ctx->endDebugLabel();
     });
 

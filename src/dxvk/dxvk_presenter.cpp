@@ -50,6 +50,10 @@ namespace dxvk {
     // the present fence if presentation is queued but fails.
     // TODO Remove this hack when this gets fixed in stable SteamOS.
     m_hasGamescopeFenceSignalBug = env::getEnvVar("ENABLE_GAMESCOPE_WSI") == "1";
+
+    // NV reportely does not signal the present fence when the report
+    // queue is full.
+    m_hasNvidiaFenceSignalBug = m_device->adapter()->matchesDriver(VK_DRIVER_ID_NVIDIA_PROPRIETARY);
   }
 
   
@@ -199,20 +203,26 @@ namespace dxvk {
     regionInfo.swapchainCount = 1;
     regionInfo.pRegions = &region;
 
-    // Present timing isn't useful with Immediate or Mailbox
+    // Present timing isn't useful with Immediate or Mailbox. Mailbox can also
+    // lead to the report queue overflowing when running significantly above
+    // display refresh, so don't bother with report timing.
     bool isFifoMode = m_presentMode == VK_PRESENT_MODE_FIFO_KHR
                    || m_presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-
-    bool waitForPresent = m_hasPresentWait && isFifoMode;
 
     uint64_t frameTargetTime = 0u;
 
     VkPresentTimingInfoEXT timingInfo = { VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT };
-    timingInfo.presentStageQueries = m_timingMode.presentStage;
     timingInfo.timeDomainId = m_timingMode.timeDomainId;
 
     if (m_timingMode.presentStage && isFifoMode) {
       std::lock_guard lock(m_timingMutex);
+      timingInfo.presentStageQueries = m_timingMode.presentStage;
+
+      // Try to avoid overflowing the driver-internal report queue
+      if (m_reportQueueAddId >= m_reportQueueTakeId + FrameQueueSize) {
+        Logger::warn("Presenter: Report queue overflow");
+        timingInfo.presentStageQueries = 0u;
+      }
 
       if (m_timingMode.referenceFrameId) {
         frameTargetTime = m_timingMode.referenceTime +
@@ -229,10 +239,6 @@ namespace dxvk {
 
         if (m_timingDisplayInfo && !m_timingDisplayInfo->isVariableRefresh)
           timingInfo.flags |= VK_PRESENT_TIMING_INFO_PRESENT_AT_NEAREST_REFRESH_CYCLE_BIT_EXT;
-
-        // Skip present_wait in fixed refresh mode if the frame is timed
-        if (!m_timingDisplayInfo || !m_timingDisplayInfo->isVariableRefresh)
-          waitForPresent = waitForPresent && !timingInfo.targetTime;
       }
     }
 
@@ -268,13 +274,6 @@ namespace dxvk {
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
 
-    // Treat a QUEUE_FULL error as a hint to recreate the swapchain with
-    // a larger queue size. This could probably be done more robustly,
-    // but since we have latency constraints in the frontend APIs, we
-    // should never run into this scenario in practice anyway.
-    if (status == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT)
-      m_timingQueueSize *= 2u;
-
     // Maintain valid state if presentation succeeded, even if we want to
     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
     // semaphore and fence signals, still happen if present fails with
@@ -286,6 +285,9 @@ namespace dxvk {
 
       if (m_hasGamescopeFenceSignalBug)
         currSync.fenceSignaled = status >= 0;
+
+      if (m_hasNvidiaFenceSignalBug)
+        currSync.fenceSignaled &= status != VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT;
     }
 
     if (status >= 0) {
@@ -293,6 +295,9 @@ namespace dxvk {
 
       m_frameIndex += 1;
       m_frameIndex %= m_semaphores.size();
+
+      if (timingInfo.presentStageQueries)
+        m_reportQueueAddId = frameId;
     }
 
     // Add frame to waiter queue with current properties
@@ -304,8 +309,7 @@ namespace dxvk {
     frame.targetTime = frameTargetTime;
     frame.targetDeadline = frameTargetTime ? frameTargetTime + m_timingMode.frameIntervalNs : 0u;
     frame.timingDomainId = timingInfo.timeDomainId;
-    frame.isTimed = bool(timingInfo.targetTime);
-    frame.doWait = waitForPresent;
+    frame.stageQueries = timingInfo.presentStageQueries;
 
     pushFrame(frame);
 
@@ -586,7 +590,7 @@ namespace dxvk {
 
   PresenterTimingFeedback Presenter::queryPresentTiming() {
     std::lock_guard lock(m_timingMutex);
-    return m_timingFeedback;
+    return updatePresentTimingFeedback(0u, 0u);
   }
 
 
@@ -786,10 +790,7 @@ namespace dxvk {
     // If present timing is supported, also check if there is a useful present
     // stage we can use. Prioritize the latest available stage for absolute
     // timing since we need to correlate with timing reports.
-    // Also, opt out of timing if we have issues keeping the report queue to
-    // a reasonable size.
-    if (presentTimingCaps.presentTimingSupported && presentId2Caps.presentId2Supported
-     && presentWait2Caps.presentWait2Supported && m_timingQueueSize <= MaxFrameQueueSize) {
+    if (presentTimingCaps.presentTimingSupported && presentId2Caps.presentId2Supported) {
       small_vector<VkPresentStageFlagBitsEXT, 3> stages;
 
       if (presentTimingCaps.presentAtAbsoluteTimeSupported) {
@@ -878,6 +879,9 @@ namespace dxvk {
       "\n  Timing:          ", (m_timingMode.supportsAbsolute
         ? (m_timingMode.supportsRelative ? "yes (absolute, relative)" : "yes (absolute)")
         : (m_timingMode.supportsRelative ? "yes (relative)" : "no"))));
+
+    if (m_timingMode.presentStage)
+      Logger::info(str::format("Presenter: Using present stage ", VkPresentStageFlagBitsEXT(m_timingMode.presentStage)));
 
     if ((status = m_vkd->vkCreateSwapchainKHR(m_vkd->device(), &swapInfo, nullptr, &m_swapchain))) {
       Logger::err(str::format("Presenter: Failed to create Vulkan swapchain: ", status));
@@ -983,7 +987,7 @@ namespace dxvk {
 
     // Set up initial present timing state
     if (m_timingMode.presentStage) {
-      m_vkd->vkSetSwapchainPresentTimingQueueSizeEXT(m_vkd->device(), m_swapchain, m_timingQueueSize);
+      m_vkd->vkSetSwapchainPresentTimingQueueSizeEXT(m_vkd->device(), m_swapchain, FrameQueueSize);
 
       updateDisplayTiming();
 
@@ -1547,27 +1551,25 @@ namespace dxvk {
   }
 
 
-  bool Presenter::updatePresentTiming(uint64_t frameId) {
+  PresenterTimingFeedback Presenter::updatePresentTimingFeedback(
+        uint64_t                  frameId,
+        VkPresentStageFlagsEXT    queryStages) {
     // Need to access both timing stuff and the frame queue here
     std::lock_guard lock(m_timingMutex);
 
     PresenterTimingFeedback feedback = {};
     feedback.frameId = frameId;
-    feedback.presentTime = dxvk::high_resolution_clock::get_counter();
+    feedback.presentTime = frameId ? dxvk::high_resolution_clock::get_counter() : 0u;
 
-    if (!m_timingMode.presentStage) {
-      commitTimingFeedback(feedback);
-      return false;
-    }
+    if (!m_timingMode.presentStage)
+      return commitTimingFeedback(feedback);
 
-    // Still need to drain the queue even if everything is messed up
-    small_vector<VkPresentStageTimeEXT, FrameQueueSize> stageTimes;
-    small_vector<VkPastPresentationTimingEXT, FrameQueueSize> reports;
+    // Query reports in-order so that we can somewhat robustly
+    // track how many frames are still in the report queue
+    std::array<VkPresentStageTimeEXT,       FrameQueueSize> stageTimes = {};
+    std::array<VkPastPresentationTimingEXT, FrameQueueSize> reports = {};
 
-    stageTimes.resize(m_timingQueueSize);
-    reports.resize(m_timingQueueSize);
-
-    for (size_t i = 0u; i < m_timingQueueSize; i++) {
+    for (size_t i = 0u; i < reports.size(); i++) {
       reports[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
       reports[i].presentStageCount = 1u;
       reports[i].pPresentStages = &stageTimes[i];
@@ -1585,8 +1587,7 @@ namespace dxvk {
 
     if (status) {
       Logger::warn(str::format("Presenter: Failed to query past present timings: ", status));
-      commitTimingFeedback(feedback);
-      return false;
+      return commitTimingFeedback(feedback);
     }
 
     // Update display timing and time domains as necessary
@@ -1602,7 +1603,7 @@ namespace dxvk {
       updateTimingDomains();
 
       if (!recalibrateTimeDomains())
-        return false;
+        return commitTimingFeedback(feedback);
     }
 
     if (updateMode)
@@ -1618,7 +1619,14 @@ namespace dxvk {
       const auto& time = stageTimes[i];
       const auto& report = reports[i];
 
-      if (!report.reportComplete || !time.time || time.stage != m_timingMode.presentStage)
+      if (!report.reportComplete)
+        continue;
+
+      // Write back frame ID regardless of whether we do anything with the
+      // report so that we can track which frames are still in the queue
+      m_reportQueueTakeId = std::max(m_reportQueueTakeId, report.presentId);
+
+      if (!time.time || time.stage != m_timingMode.presentStage)
         continue;
 
       // Find queued frame entry so we can properly correlate the report
@@ -1661,26 +1669,28 @@ namespace dxvk {
       m_timingMode.referenceTime = m_timingMode.lastFrameTimeLocal;
     }
 
-    // We can't give meaningful feedback w/o QPC timing currently.
-    // TODO figure out correct time domain for dxvk-native if we're
-    // really interested, otherwise just ignore the problem.
-    if (m_timingMode.lastFrameTimeQpc) {
+    // Update feedback from timing reports only if two conditions are true:
+    // - The current frame was submitted with a timing query.
+    // - We successfully mapped the report timestamp back to QPC.
+    // TODO figure out the correct time domain for dxvk-native to use.
+    if (m_timingMode.lastFrameTimeQpc && (!frameId || queryStages)) {
       feedback.frameId = m_timingMode.lastFrameId;
       feedback.presentTime = m_timingMode.lastFrameTimeQpc;
     }
 
-    commitTimingFeedback(feedback);
-    return true;
+    return commitTimingFeedback(feedback);
   }
 
 
-  void Presenter::commitTimingFeedback(
+  PresenterTimingFeedback Presenter::commitTimingFeedback(
     const PresenterTimingFeedback&  feedback) {
     // Only commit present timing if the new frame ID is larger than the
     // previous frame ID, in order to avoid reverting the counter in case
     // the application spins on present statistics.
     if (feedback.frameId > m_timingFeedback.frameId)
       m_timingFeedback = feedback;
+
+    return m_timingFeedback;
   }
 
 
@@ -2082,10 +2092,16 @@ namespace dxvk {
         }
       }
 
-      // If the present operation has succeeded, actually wait for it to complete.
-      // Don't bother with it on MAILBOX / IMMEDIATE modes since doing so would
-      // restrict us to the display refresh rate on some platforms (XWayland).
-      if (frame.result >= 0 && frame.doWait) {
+      // If the frameis timed, wait for the calculated target time. This intentionally
+      // does not line up with vblank in fixed refresh rate scenarios and is done so
+      // that the application's render thread can see consistent frame pacing.
+      bool waited = frame.targetTime && waitUntilFrameTargetTime(frame);
+
+      // If this doesn't apply,
+      bool isFifoMode = m_presentMode == VK_PRESENT_MODE_FIFO_KHR
+                     || m_presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+
+      if (!waited && isFifoMode && frame.result >= 0 && m_hasPresentWait) {
         VkResult vr;
 
         if (m_device->features().khrPresentWait2.presentWait2) {
@@ -2110,13 +2126,13 @@ namespace dxvk {
         frame.tracker = nullptr;
       }
 
+      // Update timing feedback. There is no guarantee when data becomes available,
+      // but if timing is disabled then we should base feedback on present_wait.
+      updatePresentTimingFeedback(frame.frameId, frame.stageQueries);
+
       // Apply FPS limiter here to align it as closely with scanout as we can,
       // and delay signaling the frame latency event to emulate behaviour of a
       // low refresh rate display as closely as we can.
-      bool waited = updatePresentTiming(frame.frameId)
-        && frame.isTimed && frame.targetTime
-        && waitUntilFrameTargetTime(frame);
-
       if (!waited)
         m_fpsLimiter.delay();
 

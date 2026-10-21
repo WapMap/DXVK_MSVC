@@ -53,6 +53,10 @@ namespace dxvk {
     m_shaderOptions     (GetShaderOptions(m_dxvkDevice, m_d3d11Options)),
     m_maxFeatureLevel   (D3D11DeviceFeatures::GetMaxFeatureLevel(*m_dxvkDevice)),
     m_deviceFeatures    (*m_dxvkDevice, m_d3d11Options, m_featureLevel) {
+    // This option might lead to long-running submissions
+    if (m_d3d11Options.reproducibleCommandStream)
+      m_dxvkDevice->setSubmissionTimeout(-1ull);
+
     m_initializer = new D3D11Initializer(this);
     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
     m_d3d10Device = new D3D10Device(this, m_context.ptr());
@@ -1851,7 +1855,7 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE D3D11Device::SetExceptionMode(UINT RaiseFlags) {
     Logger::err("D3D11Device::SetExceptionMode: Not implemented");
-    return E_NOTIMPL;
+    return S_OK;
   }
   
   
@@ -2081,7 +2085,7 @@ namespace dxvk {
     } (shaderInfo.getType());
 
     if (ShaderKey.stage() != shaderStage) {
-      bool mismatch = !ShaderKey.hasXfb() || (
+      bool mismatch = ModuleInfo.xfbEntries.empty() || (
         shaderStage != VK_SHADER_STAGE_VERTEX_BIT &&
         shaderStage != VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
 

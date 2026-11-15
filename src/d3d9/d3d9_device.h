@@ -926,8 +926,7 @@ namespace dxvk {
     void Flush();
     void FlushAndSync9On12();
 
-    void BeginFrame(Rc<DxvkLatencyTracker> LatencyTracker, uint64_t FrameId);
-    void EndFrame(Rc<DxvkLatencyTracker> LatencyTracker);
+    void EndFrame();
 
     template <uint32_t Index>
     void UpdateAnyColorWrites();
@@ -1099,6 +1098,10 @@ namespace dxvk {
     HRESULT ResetSwapChain(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode);
 
     HRESULT InitialReset(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode);
+
+    D3D9SwapChainEx* GetHeadSwapChain(UINT iSwapChain) const;
+
+    uint32_t GetHeadCount() const;
 
     /**
      * \brief Returns the allocator used for unmappable system memory texture data
@@ -1603,6 +1606,7 @@ namespace dxvk {
     Com<D3D9Surface, false>         m_autoDepthStencil;
 
     Com<D3D9SwapChainEx, false>     m_implicitSwapchain;
+    std::vector<Com<D3D9SwapChainEx, false>> m_groupHeads;
 
     D3D9ShaderOptions               m_shaderOptions;
     DxvkShaderOptions               m_dxvkShaderOptions;

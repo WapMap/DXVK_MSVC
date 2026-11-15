@@ -139,27 +139,6 @@ namespace dxvk {
   }
 
 
-  void DxvkContext::beginLatencyTracking(
-    const Rc<DxvkLatencyTracker>&     tracker,
-          uint64_t                    frameId) {
-    if (tracker && (!m_latencyTracker || m_latencyTracker == tracker)) {
-      tracker->notifyCsRenderBegin(frameId);
-
-      m_latencyTracker = tracker;
-      m_latencyFrameId = frameId;
-
-      m_endLatencyTracking = false;
-    }
-  }
-
-
-  void DxvkContext::endLatencyTracking(
-    const Rc<DxvkLatencyTracker>&     tracker) {
-    if (tracker && tracker == m_latencyTracker)
-      m_endLatencyTracking = true;
-  }
-
-
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
           uint64_t                    submissionId) {
@@ -177,23 +156,7 @@ namespace dxvk {
                        DxvkContextFeature::DescriptorBuffer))
       m_cmd->setDescriptorSyncHandle(m_descriptorWorker.getSyncHandle());
 
-    // Need to call this before submitting so that the last GPU
-    // submission does not happen before the render end signal.
-    if (m_endLatencyTracking && m_latencyTracker)
-      m_latencyTracker->notifyCsRenderEnd(m_latencyFrameId);
-
-    m_device->submitCommandList(this->endRecording(reason),
-      m_latencyTracker, m_latencyFrameId, submissionId);
-
-    // Ensure that subsequent submissions do not see the tracker.
-    // It is important to hide certain internal submissions in
-    // case the application is CPU-bound.
-    if (m_endLatencyTracking) {
-      m_latencyTracker = nullptr;
-      m_latencyFrameId = 0u;
-
-      m_endLatencyTracking = false;
-    }
+    m_device->submitCommandList(this->endRecording(reason), submissionId);
 
     // If we have a zero buffer, see if we can get rid of it
     freeZeroBuffer();
@@ -2948,10 +2911,8 @@ namespace dxvk {
     }
 
     if (unlikely(rs.sampleCount() != m_state.gp.state.rs.sampleCount())) {
-      m_flags.set(DxvkContextFlag::GpDirtySampleLocations);
-
-      if (!m_state.gp.state.ms.sampleCount())
-        m_flags.set(DxvkContextFlag::GpDirtyMultisampleState);
+      m_flags.set(DxvkContextFlag::GpDirtySampleLocations,
+                  DxvkContextFlag::GpDirtyMultisampleState);
 
       if (!m_features.test(DxvkContextFeature::VariableMultisampleRate))
         m_flags.set(DxvkContextFlag::GpRenderPassNeedsFlush);
@@ -8005,16 +7966,9 @@ namespace dxvk {
 
       // Infer actual sample count from both the multisample state
       // and rasterizer state, just like during pipeline creation
-      VkSampleCountFlagBits sampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
-
-      if (!sampleCount) {
-        sampleCount = m_state.gp.state.rs.sampleCount()
-          ? VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount())
-          : VK_SAMPLE_COUNT_1_BIT;
-      }
-
-      VkSampleMask sampleMask = m_state.gp.state.ms.sampleMask() & ((1u << sampleCount) - 1u);
-      m_cmd->cmdSetMultisampleState(sampleCount, sampleMask);
+      auto sampleCount = m_state.gp.state.determineRasterSamples(m_device->canUseMixedSamples(m_state.gp.shaders.fs));
+      auto sampleMask = m_state.gp.state.ms.sampleMask() & ((1u << uint32_t(sampleCount)) - 1u);
+      m_cmd->cmdSetMultisampleState(sampleCount, VkSampleMask(sampleMask));
 
       if (m_device->features().extExtendedDynamicState3.extendedDynamicState3AlphaToCoverageEnable
        && !m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasSampleMaskExport))
@@ -8033,21 +7987,17 @@ namespace dxvk {
       // render most of its content with regular sample positions and only draw a small portion
       // with centered positions, so we would want the default interpretation to use default
       // sample positions anyway, e.g. for the purpose of copies or resolves.
-      VkSampleCountFlagBits msSampleCount = VkSampleCountFlagBits(m_state.gp.state.ms.sampleCount());
-      VkSampleCountFlagBits rsSampleCount = VkSampleCountFlagBits(m_state.gp.state.rs.sampleCount());
-
-      if (!msSampleCount)
-        msSampleCount = rsSampleCount ? rsSampleCount : VK_SAMPLE_COUNT_1_BIT;
+      auto sampleCount = m_state.gp.state.determineRasterSamples(m_device->canUseMixedSamples(m_state.gp.shaders.fs));
 
       bool center = m_state.gp.state.useSampleLocations();
-      bool enable = m_device->canUseSampleLocations(msSampleCount);
+      bool enable = m_device->canUseSampleLocations(sampleCount);
 
       if (enable && m_state.om.renderTargets.depth.view) {
         auto flags = m_state.om.renderTargets.depth.view->image()->info().flags;
         enable = bool(flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
       }
 
-      VkSampleLocationsInfoEXT locations = util::setupSampleLocations(msSampleCount, center);
+      VkSampleLocationsInfoEXT locations = util::setupSampleLocations(sampleCount, center);
       m_cmd->cmdSetSampleLocations(enable && center, &locations);
     }
 
@@ -9008,15 +8958,15 @@ namespace dxvk {
         planeCount = vk::getPlaneCount(formatInfo->aspectMask);
 
       for (uint32_t p = 0; p < planeCount; p++) {
-        for (uint32_t m = 0; m < info.image->info().mipLevels; m++) {
+        for (uint32_t m = 0; m < availableSubresources.levelCount; m++) {
           VkImageSubresourceRange subresourceRange = availableSubresources;
           subresourceRange.baseMipLevel = m;
           subresourceRange.levelCount = 1u;
 
           uint32_t layerStep = info.image->isInitialized(subresourceRange)
-            ? subresourceRange.layerCount : 1u;
+            ? availableSubresources.layerCount : 1u;
 
-          for (uint32_t l = 0; l < subresourceRange.layerCount; l += layerStep) {
+          for (uint32_t l = 0; l < availableSubresources.layerCount; l += layerStep) {
             subresourceRange.baseArrayLayer = l;
             subresourceRange.layerCount = layerStep;
 
